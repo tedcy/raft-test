@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package raft;
+
+service Raft {
+    rpc Vote(VoteRequest) returns (VoteResponse) {}
+    rpc HeartBeat(HeartBeatRequest) returns (HeartBeatResponse) {}
+    rpc Set(SetRequest) returns (SetResponse) {}
+    rpc Get(GetRequest) returns (GetResponse) {}
+}
+
+message VoteRequest {
+    uint64 term = 1;
+    string addr = 2;
+}
+
+message VoteResponse {
+    bool ok = 1;
+}
+
+message HeartBeatRequest {
+    uint64 term = 1;
+    string addr = 2;
+}
+
+message HeartBeatResponse {
+}
+
+message SetRequest {
+    string key = 1;
+    string value = 2;
+}
+
+message SetResponse {
+}
+
+message GetRequest {
+    string key = 1;
+}
+
+message GetResponse {
+    string value = 1;
+}

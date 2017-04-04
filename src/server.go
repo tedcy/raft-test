@@ -27,7 +27,7 @@ func init() {
 }
 
 func electionTimeout() time.Duration {
-	return time.Duration((RandRand.Int() % 300)* 2) * time.Millisecond
+	return time.Duration(RandRand.Int() % 300 + 150) * time.Millisecond
 }
 
 type raftClient struct {
@@ -47,13 +47,6 @@ func (this *termCheck) checkVote(term uint64, vote string) bool {
 		this.vote = vote
 		return true
     }
-	if term == this.term {
-		if this.vote == "" {
-			this.vote = vote
-			return true
-        }
-		return false
-    }
 	return false
 }
 
@@ -70,10 +63,11 @@ type Server struct {
 	status			Status
 	term			uint64
 	addrList		[]string
-	servers			[]*raftClient
+	clients			[]*raftClient
 	myAdrr			string
 	check			termCheck
-	stop			chan bool
+	stopFollower	chan bool
+	stopCandidate	chan bool
 	t				*time.Timer
 	grpcServer		*grpc.Server
 	lis				net.Listener
@@ -82,19 +76,22 @@ type Server struct {
 
 func (this *Server)	Vote(ctx context.Context, in *raft.VoteRequest) (*raft.VoteResponse, error) {
 	var resp raft.VoteResponse
+	log.Infof("vote req term %d addr %s",in.Term, in.Addr)
 	if this.check.checkVote(in.Term, in.Addr) {
 		resp.Ok = true
-		this.stop <- true
+		this.stopFollower <- true
     }else {
 		resp.Ok = false
 	}
+	log.Infof("vote resp %v",resp.Ok)
 	return &resp, nil
 }
 
 func (this *Server) HeartBeat(ctx context.Context, in *raft.HeartBeatRequest) (*raft.HeartBeatResponse, error) {
 	var resp raft.HeartBeatResponse
+	log.Infof("heartbeat req term %d addr %s",in.Term, in.Addr)
 	if this.check.checkLeader(in.Term, in.Addr) {
-		this.stop <- true
+		this.stopCandidate <- true
     }
 	return &resp, nil
 }
@@ -124,10 +121,11 @@ func (this *Server) houseKeeper() {
 	for {
 		switch this.status {
 		case Follower:
+			log.Info("into follower")
 			this.t = time.NewTimer(electionTimeout())
 			stop = false
 			select {
-				case <-this.stop:
+				case <-this.stopFollower:
 					stop = true
 					this.t.Stop()
 				case <-this.t.C:
@@ -136,11 +134,12 @@ func (this *Server) houseKeeper() {
 				this.status = Candidate
             }
 		case Candidate:
+			log.Info("into candidate")
 			var count int
 			this.t = time.NewTimer(electionTimeout())
 			stop = false
 			select {
-				case <-this.stop:
+				case <-this.stopCandidate:
 					stop = true
 					this.t.Stop()
 				case <-this.t.C:
@@ -148,44 +147,42 @@ func (this *Server) houseKeeper() {
 			if !stop {
 				this.term++
 				count++
-				for _, s := range this.servers {
+				for _, s := range this.clients {
 					req := &raft.VoteRequest{}
 					req.Term = this.term
 					req.Addr = this.myAdrr
 					resp, err := s.Vote(context.TODO(), req)
 					if err != nil {
 						log.Error(err)
+						continue
 					}
 					if resp.Ok {
 						count++
 					}
-					if count > len(this.servers)/2{
+					if count > len(this.clients)/2{
 						this.status = Leader
 					}
 				}
+				log.Infof("voted %d",count)
             }else {
 				this.status = Follower
             }
 		case Leader:
+			log.Info("into leader")
 			this.t = time.NewTimer(20 * time.Millisecond)
-			stop = false
 			select {
-				case <-this.stop:
-					stop = true
-					this.t.Stop()
 				case <-this.t.C:
 			}
-			if !stop {
-				for _, s := range this.servers {
-					req := &raft.HeartBeatRequest{}
-					req.Term = this.term
-					req.Addr = this.myAdrr
-					_, err := s.HeartBeat(context.TODO(), req)
-					if err != nil {
-						log.Error(err)
-					}
+			for _, s := range this.clients {
+				req := &raft.HeartBeatRequest{}
+				req.Term = this.term
+				req.Addr = this.myAdrr
+				_, err := s.HeartBeat(context.TODO(), req)
+				if err != nil {
+					log.Error(err)
+					continue
 				}
-            }
+			}
         }
     }
 }
@@ -205,7 +202,8 @@ func NewServer(c *config.Config) (*Server, error){
 		return nil, err
     }
 
-	s.stop = make(chan bool)
+	s.stopCandidate = make(chan bool)
+	s.stopFollower = make(chan bool)
 
 	s.addrList = c.Addr
 	for _, addr := range s.addrList {
@@ -217,6 +215,7 @@ func NewServer(c *config.Config) (*Server, error){
 		client := &raftClient{}
 		client.RaftClient = c
 		client.conn = conn
+		s.clients = append(s.clients, client)
     }
 
 	s.grpcServer = grpc.NewServer()
@@ -225,5 +224,6 @@ func NewServer(c *config.Config) (*Server, error){
 }
 
 func (this *Server) Start() error {
+	go this.houseKeeper()
 	return this.grpcServer.Serve(this.lis)
 }

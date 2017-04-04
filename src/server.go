@@ -7,7 +7,6 @@ import (
 	"coding.net/tedcy/raft-test/src/config"
 	"coding.net/tedcy/raft-test/src/data"
 	"net"
-	"sync"
 	"time"
 	"math/rand"
 	"golang.org/x/net/context"
@@ -31,44 +30,50 @@ func electionTimeout() time.Duration {
 	return time.Duration((RandRand.Int() % 300)* 2) * time.Millisecond
 }
 
-type VotedCount struct {
-	count		int
-	sync.Mutex
-}
-
-func (this *VotedCount) Add() {
-	this.Lock()
-	this.count++
-	this.Unlock()
-}
-
-func (this *VotedCount) Clean() {
-	this.Lock()
-	this.count = 0
-	this.Unlock()
-}
-
-func (this *VotedCount) Get() int{
-	this.Lock()
-	defer this.Unlock()
-	return this.count
-}
-
 type raftClient struct {
 	raft.RaftClient
 	conn			*grpc.ClientConn
 }
 
+type termCheck struct {
+	term			uint64
+	vote			string
+	leader			string
+}
+
+func (this *termCheck) checkVote(term uint64, vote string) bool {
+	if term > this.term {
+		this.term = term
+		this.vote = vote
+		return true
+    }
+	if term == this.term {
+		if this.vote == "" {
+			this.vote = vote
+			return true
+        }
+		return false
+    }
+	return false
+}
+
+func (this *termCheck) checkLeader(term uint64, leader string) bool {
+	if term > this.term {
+		this.term = term
+		this.leader = leader
+		return true
+    }
+	return false
+}
+
 type Server struct {
 	status			Status
 	term			uint64
-	votedCount		VotedCount
 	addrList		[]string
 	servers			[]*raftClient
 	myAdrr			string
-	leader			string
-	vote			string
-	alive			chan bool
+	check			termCheck
+	stop			chan bool
 	t				*time.Timer
 	grpcServer		*grpc.Server
 	lis				net.Listener
@@ -77,28 +82,19 @@ type Server struct {
 
 func (this *Server)	Vote(ctx context.Context, in *raft.VoteRequest) (*raft.VoteResponse, error) {
 	var resp raft.VoteResponse
-	this.term = in.Term
-	if this.votedCount.Get() != 0 {
+	if this.check.checkVote(in.Term, in.Addr) {
+		resp.Ok = true
+		this.stop <- true
+    }else {
 		resp.Ok = false
-		return &resp, nil
-    }
-	if this.vote != "" {
-		resp.Ok = false
-		return &resp, nil
-    }
-	this.vote = in.Addr
-	resp.Ok = true
+	}
 	return &resp, nil
 }
 
 func (this *Server) HeartBeat(ctx context.Context, in *raft.HeartBeatRequest) (*raft.HeartBeatResponse, error) {
 	var resp raft.HeartBeatResponse
-
-	if in.Term > this.term {
-		if this.status == Candidate {
-			this.status = Follower
-			this.leader = in.Addr
-        }
+	if this.check.checkLeader(in.Term, in.Addr) {
+		this.stop <- true
     }
 	return &resp, nil
 }
@@ -124,47 +120,71 @@ func (this *Server) Get(ctx context.Context, in *raft.GetRequest) (*raft.GetResp
 }
 
 func (this *Server) houseKeeper() {
-	var alive bool
+	var stop bool
 	for {
-		this.t = time.NewTimer(electionTimeout())
 		switch this.status {
 		case Follower:
-			alive = false
+			this.t = time.NewTimer(electionTimeout())
+			stop = false
 			select {
-				case <-this.alive:
-					alive = true
+				case <-this.stop:
+					stop = true
+					this.t.Stop()
 				case <-this.t.C:
 			}
-			if !alive {
+			if !stop {
 				this.status = Candidate
-				this.votedCount.Add()
             }
 		case Candidate:
-			for _, s := range this.servers {
-				req := &raft.VoteRequest{}
-				req.Term = this.term
-				req.Addr = this.myAdrr
-				resp, err := s.Vote(context.TODO(), req)
-				if err != nil {
-					log.Error(err)
-                }
-				if resp.Ok {
-					this.votedCount.Add()
-                }
-				if this.votedCount.Get() > len(this.servers){
-					this.status = Leader
-                }
+			var count int
+			this.t = time.NewTimer(electionTimeout())
+			stop = false
+			select {
+				case <-this.stop:
+					stop = true
+					this.t.Stop()
+				case <-this.t.C:
+			}
+			if !stop {
+				this.term++
+				count++
+				for _, s := range this.servers {
+					req := &raft.VoteRequest{}
+					req.Term = this.term
+					req.Addr = this.myAdrr
+					resp, err := s.Vote(context.TODO(), req)
+					if err != nil {
+						log.Error(err)
+					}
+					if resp.Ok {
+						count++
+					}
+					if count > len(this.servers)/2{
+						this.status = Leader
+					}
+				}
+            }else {
+				this.status = Follower
             }
 		case Leader:
-			this.votedCount.Clean()
-			for _, s := range this.servers {
-				req := &raft.HeartBeatRequest{}
-				req.Term = this.term
-				req.Addr = this.myAdrr
-				_, err := s.HeartBeat(context.TODO(), req)
-				if err != nil {
-					log.Error(err)
-                }
+			this.t = time.NewTimer(20 * time.Millisecond)
+			stop = false
+			select {
+				case <-this.stop:
+					stop = true
+					this.t.Stop()
+				case <-this.t.C:
+			}
+			if !stop {
+				for _, s := range this.servers {
+					req := &raft.HeartBeatRequest{}
+					req.Term = this.term
+					req.Addr = this.myAdrr
+					_, err := s.HeartBeat(context.TODO(), req)
+					if err != nil {
+						log.Error(err)
+					}
+				}
             }
         }
     }
@@ -185,7 +205,7 @@ func NewServer(c *config.Config) (*Server, error){
 		return nil, err
     }
 
-	s.alive = make(chan bool)
+	s.stop = make(chan bool)
 
 	s.addrList = c.Addr
 	for _, addr := range s.addrList {
@@ -199,8 +219,8 @@ func NewServer(c *config.Config) (*Server, error){
 		client.conn = conn
     }
 
-	grpcServer := grpc.NewServer()
-	raft.RegisterRaftServer(grpcServer, &s)
+	s.grpcServer = grpc.NewServer()
+	raft.RegisterRaftServer(s.grpcServer, &s)
 	return &s, nil
 }
 

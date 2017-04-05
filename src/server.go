@@ -170,11 +170,12 @@ func (this *Server)	Vote(ctx context.Context, in *raft.VoteRequest) (*raft.VoteR
 
 func (this *Server) HeartBeat(ctx context.Context, in *raft.HeartBeatRequest) (*raft.HeartBeatResponse, error) {
 	var resp raft.HeartBeatResponse
-	//如果in.term大于this.term，那么变成addr的follower
+	//如果in.term大于this.term，那么变成addr的follower，并且更新follower的定时器
 	//如果in.term==this.term，那么更新follower的定时器
 	if in.Term > this.check.term {
 		this.check.Set(in.Term)
 		this.check.becomeFollower()
+		this.stopFollower.Stop()
     }
 	if in.Term == this.check.term {
 		this.stopFollower.Stop()

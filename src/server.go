@@ -10,6 +10,7 @@ import (
 	"time"
 	"math/rand"
 	"golang.org/x/net/context"
+	"sync"
 )
 
 type Status int
@@ -27,23 +28,28 @@ func init() {
 }
 
 func electionTimeout() time.Duration {
-	return time.Duration(RandRand.Int() % 300 + 150) * time.Millisecond
+	return time.Duration(RandRand.Int() % 150 + 150) * time.Millisecond
 }
 
 type raftClient struct {
 	raft.RaftClient
 	conn			*grpc.ClientConn
+	addr			string
 }
 
 type termCheck struct {
 	term			uint64
 	vote			string
 	leader			string
+	status			Status
+	sync.Mutex
 }
 
 func (this *termCheck) checkVote(term uint64, vote string) bool {
 	if term > this.term {
+		this.Lock()
 		this.term = term
+		this.Unlock()
 		this.vote = vote
 		return true
     }
@@ -52,22 +58,89 @@ func (this *termCheck) checkVote(term uint64, vote string) bool {
 
 func (this *termCheck) checkLeader(term uint64, leader string) bool {
 	if term > this.term {
+		this.Lock()
 		this.term = term
+		this.Unlock()
 		this.leader = leader
 		return true
     }
 	return false
 }
 
+func (this *termCheck) becomeFollower() {
+	this.Lock()
+	defer this.Unlock()
+	this.status = Follower
+}
+
+func (this *termCheck) becomeCandidate() {
+	this.Lock()
+	defer this.Unlock()
+	if this.status == Leader {
+		return
+    }
+	this.term++
+	this.status = Candidate
+}
+
+func (this *termCheck) becomeLeader() {
+	this.Lock()
+	defer this.Unlock()
+	this.status = Leader
+}
+
+func (this *termCheck) Get() uint64{
+	return this.term
+}
+
+type TimerStoper struct {
+	t				*time.Timer
+	ifStop			bool
+	sync.Mutex
+}
+
+func NewTimerStoper() *TimerStoper {
+	var ts TimerStoper
+	return &ts
+}
+
+func (this *TimerStoper) Set(t time.Duration) {
+	this.t = time.NewTimer(t)
+}
+
+//if stop by chan, return ture
+func (this *TimerStoper) Wait() bool{
+	this.Lock()
+	this.ifStop = false
+	this.Unlock()
+	select {
+	case <-this.t.C:
+		this.t.Stop()
+		this.Lock()
+		defer this.Unlock()
+		if this.ifStop {
+			log.Info("wait end by stop")
+			return true
+        }
+		log.Info("wait end")
+		return false
+    }
+}
+
+func (this *TimerStoper) Stop() {
+	this.Lock()
+	defer this.Unlock()
+	if !this.ifStop {
+		this.ifStop = true
+    }
+}
+
 type Server struct {
-	status			Status
-	term			uint64
 	addrList		[]string
 	clients			[]*raftClient
 	myAdrr			string
 	check			termCheck
-	stopFollower	chan bool
-	stopCandidate	chan bool
+	stopFollower	*TimerStoper
 	t				*time.Timer
 	grpcServer		*grpc.Server
 	lis				net.Listener
@@ -79,7 +152,7 @@ func (this *Server)	Vote(ctx context.Context, in *raft.VoteRequest) (*raft.VoteR
 	log.Infof("vote req term %d addr %s",in.Term, in.Addr)
 	if this.check.checkVote(in.Term, in.Addr) {
 		resp.Ok = true
-		this.stopFollower <- true
+		this.stopFollower.Stop()
     }else {
 		resp.Ok = false
 	}
@@ -91,7 +164,7 @@ func (this *Server) HeartBeat(ctx context.Context, in *raft.HeartBeatRequest) (*
 	var resp raft.HeartBeatResponse
 	log.Infof("heartbeat req term %d addr %s",in.Term, in.Addr)
 	if this.check.checkLeader(in.Term, in.Addr) {
-		this.stopCandidate <- true
+		this.check.becomeFollower()
     }
 	return &resp, nil
 }
@@ -119,72 +192,79 @@ func (this *Server) Get(ctx context.Context, in *raft.GetRequest) (*raft.GetResp
 func (this *Server) houseKeeper() {
 	var stop bool
 	for {
-		switch this.status {
+		switch this.check.status {
 		case Follower:
 			log.Info("into follower")
-			this.t = time.NewTimer(electionTimeout())
-			stop = false
-			select {
-				case <-this.stopFollower:
-					stop = true
-					this.t.Stop()
-				case <-this.t.C:
-			}
+			this.stopFollower.Set(electionTimeout())
+			stop = this.stopFollower.Wait()
 			if !stop {
-				this.status = Candidate
+				this.check.becomeCandidate()
             }
 		case Candidate:
 			log.Info("into candidate")
-			var count int
-			this.t = time.NewTimer(electionTimeout())
-			stop = false
-			select {
-				case <-this.stopCandidate:
-					stop = true
-					this.t.Stop()
-				case <-this.t.C:
-			}
-			if !stop {
-				this.term++
-				count++
+			t := time.Now()
+			for {
+				count := 1
+				var wg sync.WaitGroup
+				var lock sync.Mutex
 				for _, s := range this.clients {
-					req := &raft.VoteRequest{}
-					req.Term = this.term
-					req.Addr = this.myAdrr
-					resp, err := s.Vote(context.TODO(), req)
-					if err != nil {
-						log.Error(err)
-						continue
-					}
-					if resp.Ok {
-						count++
-					}
-					if count > len(this.clients)/2{
-						this.status = Leader
-					}
+					wg.Add(1)
+					go func(s *raftClient) {
+						defer wg.Done()
+						req := &raft.VoteRequest{}
+						req.Term = this.check.Get()
+						req.Addr = this.myAdrr
+						//ctx, _ := context.WithTimeout(context.Background(), 200*time.Millisecond)
+						ctx := context.Background()
+						resp, err := s.Vote(ctx, req)
+						if err != nil {
+							log.Errorf("vote to %s failed: %s", s.addr, err)
+							return
+						}
+						if resp.Ok {
+							lock.Lock()
+							count++
+							lock.Unlock()
+						}
+					}(s)
 				}
+				wg.Wait()
 				log.Infof("voted %d",count)
-            }else {
-				this.status = Follower
-            }
+				if count > len(this.clients)/2 && this.check.status == Candidate{
+					this.check.becomeLeader()
+					break
+				}
+				if this.check.status == Follower {
+					break
+                }
+				if time.Duration(time.Since(t).Nanoseconds()) > 100 * time.Millisecond{
+					this.check.becomeCandidate()
+					break
+                }
+				select {
+				case <-time.After(10 * time.Millisecond):
+				}
+			}
 		case Leader:
 			log.Info("into leader")
 			this.t = time.NewTimer(20 * time.Millisecond)
 			select {
-				case <-this.t.C:
+			case <-this.t.C:
 			}
 			for _, s := range this.clients {
 				req := &raft.HeartBeatRequest{}
-				req.Term = this.term
+				req.Term = this.check.Get()
 				req.Addr = this.myAdrr
-				_, err := s.HeartBeat(context.TODO(), req)
+				//ctx, _ := context.WithTimeout(context.Background(), 20*time.Millisecond)
+				ctx := context.Background()
+				_, err := s.HeartBeat(ctx, req)
 				if err != nil {
 					log.Error(err)
 					continue
 				}
 			}
-        }
-    }
+		}
+	}
 }
 
 func NewServer(c *config.Config) (*Server, error){
@@ -194,29 +274,29 @@ func NewServer(c *config.Config) (*Server, error){
 	s.lis, err = net.Listen("tcp", c.MyAddr)
 	if err != nil {
 		return nil, err
-    }
+	}
 	s.myAdrr = c.MyAddr
 
 	s.data, err = data.NewData()
 	if err != nil {
 		return nil, err
-    }
+	}
 
-	s.stopCandidate = make(chan bool)
-	s.stopFollower = make(chan bool)
+	s.stopFollower = NewTimerStoper()
 
 	s.addrList = c.Addr
 	for _, addr := range s.addrList {
 		conn, err := grpc.Dial(addr, grpc.WithInsecure())
 		if err != nil {
 			return nil, err
-        }
+		}
 		c := raft.NewRaftClient(conn)
 		client := &raftClient{}
 		client.RaftClient = c
 		client.conn = conn
+		client.addr = addr
 		s.clients = append(s.clients, client)
-    }
+	}
 
 	s.grpcServer = grpc.NewServer()
 	raft.RegisterRaftServer(s.grpcServer, &s)

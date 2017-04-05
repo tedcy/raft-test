@@ -46,6 +46,7 @@ type termCheck struct {
 }
 
 func (this *termCheck) checkVote(term uint64, vote string) bool {
+	log.Infof("vote myterm %d term %d addr %s",this.term, term, vote)
 	if term > this.term {
 		this.Lock()
 		this.term = term
@@ -57,13 +58,14 @@ func (this *termCheck) checkVote(term uint64, vote string) bool {
 }
 
 func (this *termCheck) checkLeader(term uint64, leader string) bool {
-	if term > this.term {
-		this.Lock()
-		this.term = term
-		this.Unlock()
-		this.leader = leader
+	log.Infof("heartbeat myterm %d term %d addr %s",this.term, term, leader)
+	if term < this.term {
 		return true
     }
+	this.Lock()
+	this.term = term
+	this.Unlock()
+	this.leader = leader
 	return false
 }
 
@@ -91,6 +93,12 @@ func (this *termCheck) becomeLeader() {
 
 func (this *termCheck) Get() uint64{
 	return this.term
+}
+
+func (this *termCheck) Set(term uint64) {
+	this.Lock()
+	this.term = term
+	this.Unlock()
 }
 
 type TimerStoper struct {
@@ -149,23 +157,32 @@ type Server struct {
 
 func (this *Server)	Vote(ctx context.Context, in *raft.VoteRequest) (*raft.VoteResponse, error) {
 	var resp raft.VoteResponse
-	log.Infof("vote req term %d addr %s",in.Term, in.Addr)
 	if this.check.checkVote(in.Term, in.Addr) {
+		//如果in.term > this.term，那么更新follower的定时器，并且变成该addr的follower
 		resp.Ok = true
 		this.stopFollower.Stop()
+		this.check.becomeFollower()
     }else {
 		resp.Ok = false
 	}
-	log.Infof("vote resp %v",resp.Ok)
 	return &resp, nil
 }
 
 func (this *Server) HeartBeat(ctx context.Context, in *raft.HeartBeatRequest) (*raft.HeartBeatResponse, error) {
 	var resp raft.HeartBeatResponse
-	log.Infof("heartbeat req term %d addr %s",in.Term, in.Addr)
-	if this.check.checkLeader(in.Term, in.Addr) {
+	//如果in.term大于this.term，那么变成addr的follower
+	//如果in.term==this.term，那么更新follower的定时器
+	if in.Term > this.check.term {
+		this.check.Set(in.Term)
 		this.check.becomeFollower()
     }
+	if in.Term == this.check.term {
+		this.stopFollower.Stop()
+    }
+	/*if !this.check.checkLeader(in.Term, in.Addr) {
+		this.check.becomeFollower()
+		this.stopFollower.Stop()
+    }*/
 	return &resp, nil
 }
 

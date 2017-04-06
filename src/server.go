@@ -19,6 +19,11 @@ const (
 	Follower = Status(0)
 	Candidate = Status(1)
 	Leader = Status(2)
+	//ElectionTick = 1000
+	//HeartBeatTick = 100
+
+	ElectionTick = 150
+	HeartBeatTick = 20
 )
 
 var RandRand *rand.Rand 
@@ -28,7 +33,7 @@ func init() {
 }
 
 func electionTimeout() time.Duration {
-	return time.Duration(RandRand.Int() % 150 + 150) * time.Millisecond
+	return time.Duration(RandRand.Intn(ElectionTick) + ElectionTick) * time.Millisecond
 }
 
 type raftClient struct {
@@ -37,7 +42,7 @@ type raftClient struct {
 	addr			string
 }
 
-type termCheck struct {
+type raftState struct {
 	term			uint64
 	vote			string
 	leader			string
@@ -45,110 +50,83 @@ type termCheck struct {
 	sync.Mutex
 }
 
-func (this *termCheck) checkVote(term uint64, vote string) bool {
-	log.Infof("vote myterm %d term %d addr %s",this.term, term, vote)
-	if term > this.term {
-		this.Lock()
-		this.term = term
-		this.Unlock()
-		this.vote = vote
-		return true
-    }
-	return false
-}
-
-func (this *termCheck) checkLeader(term uint64, leader string) bool {
-	log.Infof("heartbeat myterm %d term %d addr %s",this.term, term, leader)
-	if term < this.term {
-		return true
-    }
-	this.Lock()
-	this.term = term
-	this.Unlock()
-	this.leader = leader
-	return false
-}
-
-func (this *termCheck) becomeFollower() {
+func (this *raftState) becomeFollower() {
 	this.Lock()
 	defer this.Unlock()
+	log.Info("becomeFollower")
 	this.status = Follower
 }
 
-func (this *termCheck) becomeCandidate() {
+func (this *raftState) becomeCandidate() {
 	this.Lock()
 	defer this.Unlock()
-	if this.status == Leader {
-		return
-    }
+	log.Info("becomeCandidate")
 	this.term++
 	this.status = Candidate
 }
 
-func (this *termCheck) becomeLeader() {
+func (this *raftState) becomeLeader() {
 	this.Lock()
 	defer this.Unlock()
+	log.Info("becomeLeader")
 	this.status = Leader
 }
 
-func (this *termCheck) Get() uint64{
+func (this *raftState) GetTerm() uint64{
 	return this.term
 }
 
-func (this *termCheck) Set(term uint64) {
+func (this *raftState) SetTerm(term uint64) {
 	this.Lock()
 	this.term = term
 	this.Unlock()
 }
 
-type TimerStoper struct {
+type FollowerTick struct {
 	t				*time.Timer
-	ifStop			bool
+	ifRefresh		bool
 	sync.Mutex
 }
 
-func NewTimerStoper() *TimerStoper {
-	var ts TimerStoper
+func NewFollowerTick() *FollowerTick {
+	var ts FollowerTick
 	return &ts
 }
 
-func (this *TimerStoper) Set(t time.Duration) {
-	this.t = time.NewTimer(t)
-}
-
 //if stop by chan, return ture
-func (this *TimerStoper) Wait() bool{
+func (this *FollowerTick) Wait(t time.Duration) bool{
+	this.t = time.NewTimer(t)
 	this.Lock()
-	this.ifStop = false
+	this.ifRefresh = false
 	this.Unlock()
 	select {
 	case <-this.t.C:
 		this.t.Stop()
 		this.Lock()
 		defer this.Unlock()
-		if this.ifStop {
-			log.Info("wait end by stop")
+		if this.ifRefresh {
+			log.Info("wait end by refresh")
 			return true
-        }
+		}
 		log.Info("wait end")
 		return false
-    }
+	}
 }
 
-func (this *TimerStoper) Stop() {
+func (this *FollowerTick) Refresh() {
 	this.Lock()
 	defer this.Unlock()
-	if !this.ifStop {
-		this.ifStop = true
-    }
+	if !this.ifRefresh {
+		this.ifRefresh = true
+	}
 }
 
 type Server struct {
 	addrList		[]string
 	clients			[]*raftClient
 	myAdrr			string
-	check			termCheck
-	stopFollower	*TimerStoper
+	raft			raftState
+	followerTick	*FollowerTick
 	t				*time.Timer
 	grpcServer		*grpc.Server
 	lis				net.Listener
@@ -157,12 +135,17 @@ type Server struct {
 
 func (this *Server)	Vote(ctx context.Context, in *raft.VoteRequest) (*raft.VoteResponse, error) {
 	var resp raft.VoteResponse
-	if this.check.checkVote(in.Term, in.Addr) {
+	log.Infof("vote myterm %d term %d addr %s",this.raft.term, in.Term, in.Addr)
+	if in.Term > this.raft.term {
 		//如果in.term > this.term，那么更新follower的定时器，并且变成该addr的follower
+		this.raft.SetTerm(in.Term)
+		this.raft.vote = in.Addr
 		resp.Ok = true
-		this.stopFollower.Stop()
-		this.check.becomeFollower()
-    }else {
+		if this.raft.status == Follower {
+			this.followerTick.Refresh()
+		}
+		this.raft.becomeFollower()
+	}else {
 		resp.Ok = false
 	}
 	return &resp, nil
@@ -170,20 +153,22 @@ func (this *Server)	Vote(ctx context.Context, in *raft.VoteRequest) (*raft.VoteR
 
 func (this *Server) HeartBeat(ctx context.Context, in *raft.HeartBeatRequest) (*raft.HeartBeatResponse, error) {
 	var resp raft.HeartBeatResponse
+	log.Infof("heartbeat myterm %d term %d addr %s",this.raft.term, in.Term, in.Addr)
 	//如果in.term大于this.term，那么变成addr的follower，并且更新follower的定时器
 	//如果in.term==this.term，那么更新follower的定时器
-	if in.Term > this.check.term {
-		this.check.Set(in.Term)
-		this.check.becomeFollower()
-		this.stopFollower.Stop()
-    }
-	if in.Term == this.check.term {
-		this.stopFollower.Stop()
-    }
-	/*if !this.check.checkLeader(in.Term, in.Addr) {
-		this.check.becomeFollower()
-		this.stopFollower.Stop()
-    }*/
+	if in.Term > this.raft.term {
+		this.raft.SetTerm(in.Term)
+		this.raft.leader = in.Addr
+		this.raft.becomeFollower()
+		if this.raft.status == Follower {
+			this.followerTick.Refresh()
+		}
+	}
+	if in.Term == this.raft.term {
+		if this.raft.status == Follower {
+			this.followerTick.Refresh()
+		}
+	}
 	return &resp, nil
 }
 
@@ -193,7 +178,7 @@ func (this *Server) Set(ctx context.Context, in *raft.SetRequest) (*raft.SetResp
 	err = this.data.Set(in.Key, in.Value)
 	if err != nil {
 		return nil, err
-    }
+	}
 	return &resp, nil
 }
 
@@ -203,75 +188,64 @@ func (this *Server) Get(ctx context.Context, in *raft.GetRequest) (*raft.GetResp
 	resp.Value, err = this.data.Get(in.Key)
 	if err != nil {
 		return nil, err
-    }
+	}
 	return &resp, nil
 }
 
 func (this *Server) houseKeeper() {
-	var stop bool
+	var ifRefresh bool
 	for {
-		switch this.check.status {
+		switch this.raft.status {
 		case Follower:
 			log.Info("into follower")
-			this.stopFollower.Set(electionTimeout())
-			stop = this.stopFollower.Wait()
-			if !stop {
-				this.check.becomeCandidate()
-            }
+			ifRefresh = this.followerTick.Wait(electionTimeout())
+			if !ifRefresh {
+				this.raft.becomeCandidate()
+			}
 		case Candidate:
 			log.Info("into candidate")
-			t := time.Now()
-			for {
-				count := 1
-				var wg sync.WaitGroup
-				var lock sync.Mutex
-				for _, s := range this.clients {
-					wg.Add(1)
-					go func(s *raftClient) {
-						defer wg.Done()
-						req := &raft.VoteRequest{}
-						req.Term = this.check.Get()
-						req.Addr = this.myAdrr
-						//ctx, _ := context.WithTimeout(context.Background(), 200*time.Millisecond)
-						ctx := context.Background()
-						resp, err := s.Vote(ctx, req)
-						if err != nil {
-							log.Errorf("vote to %s failed: %s", s.addr, err)
-							return
-						}
-						if resp.Ok {
-							lock.Lock()
-							count++
-							lock.Unlock()
-						}
-					}(s)
-				}
-				wg.Wait()
-				log.Infof("voted %d",count)
-				if count > len(this.clients)/2 && this.check.status == Candidate{
-					this.check.becomeLeader()
-					break
-				}
-				if this.check.status == Follower {
-					break
-                }
-				if time.Duration(time.Since(t).Nanoseconds()) > 100 * time.Millisecond{
-					this.check.becomeCandidate()
-					break
-                }
+			count := 1
+			var wg sync.WaitGroup
+			var lock sync.Mutex
+			for _, s := range this.clients {
+				wg.Add(1)
+				go func(s *raftClient) {
+					defer wg.Done()
+					req := &raft.VoteRequest{}
+					req.Term = this.raft.GetTerm()
+					req.Addr = this.myAdrr
+					//ctx, _ := context.WithTimeout(context.Background(), 200*time.Millisecond)
+					ctx := context.Background()
+					resp, err := s.Vote(ctx, req)
+					if err != nil {
+						log.Errorf("vote to %s failed: %s", s.addr, err)
+						return
+					}
+					if resp.Ok {
+						lock.Lock()
+						count++
+						lock.Unlock()
+					}
+				}(s)
+			}
+			wg.Wait()
+			log.Infof("voted %d",count)
+			if count > len(this.clients)/2 && this.raft.status == Candidate{
+				this.raft.becomeLeader()
+			}else {
+				this.t = time.NewTimer(electionTimeout())
 				select {
-				case <-time.After(10 * time.Millisecond):
+				case <-this.t.C:
 				}
+				if this.raft.status == Candidate {
+					this.raft.becomeCandidate()
+                }
 			}
 		case Leader:
 			log.Info("into leader")
-			this.t = time.NewTimer(20 * time.Millisecond)
-			select {
-			case <-this.t.C:
-			}
 			for _, s := range this.clients {
 				req := &raft.HeartBeatRequest{}
-				req.Term = this.check.Get()
+				req.Term = this.raft.GetTerm()
 				req.Addr = this.myAdrr
 				//ctx, _ := context.WithTimeout(context.Background(), 20*time.Millisecond)
 				ctx := context.Background()
@@ -280,6 +254,10 @@ func (this *Server) houseKeeper() {
 					log.Error(err)
 					continue
 				}
+			}
+			this.t = time.NewTimer(HeartBeatTick * time.Millisecond)
+			select {
+			case <-this.t.C:
 			}
 		}
 	}
@@ -300,7 +278,7 @@ func NewServer(c *config.Config) (*Server, error){
 		return nil, err
 	}
 
-	s.stopFollower = NewTimerStoper()
+	s.followerTick = NewFollowerTick()
 
 	s.addrList = c.Addr
 	for _, addr := range s.addrList {

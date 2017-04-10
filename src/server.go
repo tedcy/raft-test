@@ -47,7 +47,32 @@ type raftState struct {
 	vote			string
 	leader			string
 	status			Status
+	ifRefresh		bool
 	sync.Mutex
+}
+
+func (this *raftState) wait(t time.Time) {
+	timer := time.NewTimer(t)
+	this.Lock()
+	this.ifRefresh = false
+	this.Unlock()
+	select {
+	case <-this.timer.C:
+	}
+	this.Lock()
+	defer this.Unlock()
+	if this.ifRefresh {
+		log.Info("wait end by refresh")
+		return true
+	}
+	log.Info("wait end")
+	return false
+}
+
+func (this *raftState) ifRefresh() bool{
+	this.Lock()
+	defer this.Unlock()
+	return this.ifRefresh
 }
 
 func (this *raftState) becomeFollower() {
@@ -82,43 +107,8 @@ func (this *raftState) SetTerm(term uint64) {
 	this.Unlock()
 }
 
-type FollowerTick struct {
-	t				*time.Timer
-	ifRefresh		bool
-	sync.Mutex
-}
+func (this *raftState) Vote(term uint64, vote string) {
 
-func NewFollowerTick() *FollowerTick {
-	var ts FollowerTick
-	return &ts
-}
-
-//if stop by chan, return ture
-func (this *FollowerTick) Wait(t time.Duration) bool{
-	this.t = time.NewTimer(t)
-	this.Lock()
-	this.ifRefresh = false
-	this.Unlock()
-	select {
-	case <-this.t.C:
-		this.t.Stop()
-		this.Lock()
-		defer this.Unlock()
-		if this.ifRefresh {
-			log.Info("wait end by refresh")
-			return true
-		}
-		log.Info("wait end")
-		return false
-	}
-}
-
-func (this *FollowerTick) Refresh() {
-	this.Lock()
-	defer this.Unlock()
-	if !this.ifRefresh {
-		this.ifRefresh = true
-	}
 }
 
 type Server struct {
@@ -198,7 +188,7 @@ func (this *Server) houseKeeper() {
 		switch this.raft.status {
 		case Follower:
 			log.Info("into follower")
-			ifRefresh = this.followerTick.Wait(electionTimeout())
+			ifRefresh = this.raft.wait(electionTimeout())
 			if !ifRefresh {
 				this.raft.becomeCandidate()
 			}

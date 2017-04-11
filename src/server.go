@@ -47,21 +47,21 @@ type raftState struct {
 	vote			string
 	leader			string
 	status			Status
-	ifRefresh		bool
+	refresh			bool
 	sync.Mutex
 }
 
-func (this *raftState) wait(t time.Time) {
+func (this *raftState) wait(t time.Duration) bool{
 	timer := time.NewTimer(t)
 	this.Lock()
-	this.ifRefresh = false
+	this.refresh = false
 	this.Unlock()
 	select {
-	case <-this.timer.C:
+	case <-timer.C:
 	}
 	this.Lock()
 	defer this.Unlock()
-	if this.ifRefresh {
+	if this.refresh {
 		log.Info("wait end by refresh")
 		return true
 	}
@@ -72,7 +72,7 @@ func (this *raftState) wait(t time.Time) {
 func (this *raftState) ifRefresh() bool{
 	this.Lock()
 	defer this.Unlock()
-	return this.ifRefresh
+	return this.refresh
 }
 
 func (this *raftState) becomeFollower() {
@@ -90,9 +90,22 @@ func (this *raftState) becomeCandidate() {
 	this.status = Candidate
 }
 
+func (this *raftState) holdCandidate() {
+	this.Lock()
+	defer this.Unlock()
+	if this.status != Candidate {
+		return
+    }
+	log.Info("holdCandidate")
+	this.term++
+}
+
 func (this *raftState) becomeLeader() {
 	this.Lock()
 	defer this.Unlock()
+	if this.status != Candidate {
+		return
+    }
 	log.Info("becomeLeader")
 	this.status = Leader
 }
@@ -107,8 +120,39 @@ func (this *raftState) SetTerm(term uint64) {
 	this.Unlock()
 }
 
-func (this *raftState) Vote(term uint64, vote string) {
+func (this *raftState) Vote(term uint64, vote string) bool{
+	this.Lock()
+	defer this.Unlock()
+	//如果in.term > this.term，那么更新follower的定时器，并且变成该addr的follower
+	if term > this.term {
+		this.term = term
+		this.vote = vote
+		//if this.status == Follower
+		this.refresh = true
+		log.Info("becomeFollower")
+		this.status = Follower
+		return true
+    }
+	return false
+}
 
+func (this *raftState) HeartBeat(term uint64, leader string) {
+	this.Lock()
+	defer this.Unlock()
+	//如果in.term大于this.term，那么变成addr的follower，并且更新follower的定时器
+	//如果in.term==this.term，那么更新follower的定时器
+	if term > this.term {
+		this.term = term
+		this.leader = leader
+		//if this.status == Follower
+		this.refresh = true
+		log.Info("becomeFollower")
+		this.status = Follower
+	}
+	if term == this.term {
+		//if this.status == Follower
+		this.refresh = true
+	}
 }
 
 type Server struct {
@@ -116,7 +160,6 @@ type Server struct {
 	clients			[]*raftClient
 	myAdrr			string
 	raft			raftState
-	followerTick	*FollowerTick
 	t				*time.Timer
 	grpcServer		*grpc.Server
 	lis				net.Listener
@@ -126,39 +169,14 @@ type Server struct {
 func (this *Server)	Vote(ctx context.Context, in *raft.VoteRequest) (*raft.VoteResponse, error) {
 	var resp raft.VoteResponse
 	log.Infof("vote myterm %d term %d addr %s",this.raft.term, in.Term, in.Addr)
-	if in.Term > this.raft.term {
-		//如果in.term > this.term，那么更新follower的定时器，并且变成该addr的follower
-		this.raft.SetTerm(in.Term)
-		this.raft.vote = in.Addr
-		resp.Ok = true
-		if this.raft.status == Follower {
-			this.followerTick.Refresh()
-		}
-		this.raft.becomeFollower()
-	}else {
-		resp.Ok = false
-	}
+	resp.Ok = this.raft.Vote(in.Term, in.Addr)
 	return &resp, nil
 }
 
 func (this *Server) HeartBeat(ctx context.Context, in *raft.HeartBeatRequest) (*raft.HeartBeatResponse, error) {
 	var resp raft.HeartBeatResponse
 	log.Infof("heartbeat myterm %d term %d addr %s",this.raft.term, in.Term, in.Addr)
-	//如果in.term大于this.term，那么变成addr的follower，并且更新follower的定时器
-	//如果in.term==this.term，那么更新follower的定时器
-	if in.Term > this.raft.term {
-		this.raft.SetTerm(in.Term)
-		this.raft.leader = in.Addr
-		this.raft.becomeFollower()
-		if this.raft.status == Follower {
-			this.followerTick.Refresh()
-		}
-	}
-	if in.Term == this.raft.term {
-		if this.raft.status == Follower {
-			this.followerTick.Refresh()
-		}
-	}
+	this.raft.HeartBeat(in.Term, in.Addr)	
 	return &resp, nil
 }
 
@@ -220,16 +238,14 @@ func (this *Server) houseKeeper() {
 			}
 			wg.Wait()
 			log.Infof("voted %d",count)
-			if count > len(this.clients)/2 && this.raft.status == Candidate{
+			if count > len(this.clients)/2{
 				this.raft.becomeLeader()
 			}else {
 				this.t = time.NewTimer(electionTimeout())
 				select {
 				case <-this.t.C:
 				}
-				if this.raft.status == Candidate {
-					this.raft.becomeCandidate()
-                }
+				this.raft.holdCandidate()
 			}
 		case Leader:
 			log.Info("into leader")
@@ -267,8 +283,6 @@ func NewServer(c *config.Config) (*Server, error){
 	if err != nil {
 		return nil, err
 	}
-
-	s.followerTick = NewFollowerTick()
 
 	s.addrList = c.Addr
 	for _, addr := range s.addrList {

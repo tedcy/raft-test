@@ -35,11 +35,11 @@ func Test_Demo(t *testing.T) {
 	commitCs = append(commitCs, commitC2)
 	commitCs = append(commitCs, commitC3)
 	for _, c := range commitCs {
-		go func() {
+		go func(c <-chan []byte) {
 			for bs := range c {
 				commitC <- bs
 			}
-		}()
+		}(c)
 	}
 	go func() {
 		for bs := range commitC {

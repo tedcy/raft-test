@@ -153,12 +153,16 @@ func (this *RaftNode) LooperStart() {
 			//发送成功后commit
 			//从逻辑：
 			//commit新的数据
+			//println(this.id, "start")
 			for _, ent := range rd.Entries {
-				println(ent.Type.String(), string(ent.Data))
+				println(this.id, "normal", ent.Type.String(), string(ent.Data))
 			}
 			for _, ent := range rd.CommittedEntries {
-				println("commit", ent.Type.String(), string(ent.Data))
+				println(this.id, "commit", ent.Type.String(), string(ent.Data))
 			}
+			//for _, m := range rd.Messages {
+			//	println(this.id, "message", m.Type.String())
+			//}
 			this.wal.Save(rd.HardState, rd.Entries)
 			//这部分append是raft系统用于状态机同步的
 			this.raftStorage.Append(rd.Entries)
@@ -168,6 +172,7 @@ func (this *RaftNode) LooperStart() {
 			//更新节点
 			this.applyChange(ents)
 			this.node.Advance()
+			//println(this.id, "end")
 		}
 	}
 

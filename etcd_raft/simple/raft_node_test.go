@@ -1,6 +1,7 @@
 package raft_node
 
 import (
+	"time"
 	"context"
 	"testing"
 )
@@ -15,13 +16,32 @@ func Test_Demo(t *testing.T) {
 	proposeC2 := make(chan []byte)
 	proposeC3 := make(chan []byte)
 	_, _, _ = proposeC1, proposeC2, proposeC3
-	commitC := NewRaftNode(context.Background(), 1, peers,
+	commitC1 := NewRaftNode(context.Background(), 1, peers,
 		proposeC1, nil)
-	_ = NewRaftNode(context.Background(), 2, peers,
+	commitC2 := NewRaftNode(context.Background(), 2, peers,
 		proposeC2, nil)
-	_ = NewRaftNode(context.Background(), 3, peers,
+	commitC3 := NewRaftNode(context.Background(), 3, peers,
 		proposeC3, nil)
-	proposeC3 <- []byte("hello raft")
-	bs := <-commitC
-	println(string(bs))
+
+	//test
+	commitC := make(chan []byte)
+	var commitCs []<-chan []byte
+	commitCs = append(commitCs, commitC1)
+	commitCs = append(commitCs, commitC2)
+	commitCs = append(commitCs, commitC3)
+	for _, c := range commitCs {
+		go func(c <-chan []byte) {
+			for bs := range c {
+				commitC <- bs
+			}
+		}(c)
+	}
+	go func() {
+		for bs := range commitC {
+			println("msg:", string(bs))
+		}
+	}()
+	proposeC1 <- []byte("hello raft1")
+	proposeC1 <- []byte("hello raft2")
+	time.Sleep(1000 * time.Second)
 }

@@ -154,12 +154,12 @@ func (this *RaftNode) LooperStart() {
 			//从逻辑：
 			//commit新的数据
 			//println(this.id, "start")
-			for _, ent := range rd.Entries {
-				println(this.id, "normal", ent.Type.String(), string(ent.Data))
-			}
-			for _, ent := range rd.CommittedEntries {
-				println(this.id, "commit", ent.Type.String(), string(ent.Data))
-			}
+			//for _, ent := range rd.Entries {
+			//	println(this.id, "normal", ent.Type.String(), string(ent.Data))
+			//}
+			//for _, ent := range rd.CommittedEntries {
+			//	println(this.id, "commit", ent.Type.String(), string(ent.Data))
+			//}
 			//for _, m := range rd.Messages {
 			//	println(this.id, "message", m.Type.String())
 			//}

@@ -166,10 +166,10 @@ func (this *RaftNode) applyChange(ents []raftpb.Entry) {
 			}
 			this.commitC <- ent.Data
 		case raftpb.EntryConfChange:
-			/*
 			var cc raftpb.ConfChange
 			cc.Unmarshal(ent.Data)
 			//confState??
+			this.node.ApplyConfChange(cc)
 			switch cc.Type {
 			case raftpb.ConfChangeAddNode:
 				if cc.Context != nil {
@@ -181,7 +181,7 @@ func (this *RaftNode) applyChange(ents []raftpb.Entry) {
 					panic("err")
 				}
 				this.transport.RemovePeer(types.ID(cc.NodeID))
-			}*/
+			}
 		}	
 		this.appliedIndex = ent.Index
 	}

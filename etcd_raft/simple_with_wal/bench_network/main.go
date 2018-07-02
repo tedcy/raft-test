@@ -5,7 +5,7 @@ import (
 	"time"
 	"context"
 	"coding.net/tedcy/sheep/src/common/bench"
-	raft_node "coding.net/tedcy/raft-test/etcd_raft/simple"
+	raft_node "coding.net/tedcy/raft-test/etcd_raft/simple_with_wal"
 )
 
 var (
@@ -24,10 +24,11 @@ func InitFunc() (interface{}, []chan<- struct{}){
 	proposeC1 := make(chan []byte)
 	commitC := raft_node.NewRaftNode(context.Background(), *id, peers,
 		proposeC1, nil)
+	<-commitC
 	go func() {
 		for data := range commitC {
 			if len(data) != len("hello raft") {
-				panic("")
+				panic(string(data))
 			}
 		}
 	}()

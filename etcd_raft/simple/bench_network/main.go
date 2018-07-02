@@ -27,7 +27,7 @@ func InitFunc() (interface{}, []chan<- struct{}){
 	go func() {
 		for data := range commitC {
 			if len(data) != len("hello raft") {
-				panic("")
+				panic(string(data))
 			}
 		}
 	}()

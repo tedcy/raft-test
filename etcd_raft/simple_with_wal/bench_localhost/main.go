@@ -4,7 +4,7 @@ import (
 	"time"
 	"context"
 	"coding.net/tedcy/sheep/src/common/bench"
-	raft_node "coding.net/tedcy/raft-test/etcd_raft/simple"
+	raft_node "coding.net/tedcy/raft-test/etcd_raft/simple_with_wal"
 )
 
 func InitFunc() (interface{}, []chan<- struct{}){
@@ -17,16 +17,35 @@ func InitFunc() (interface{}, []chan<- struct{}){
 	proposeC2 := make(chan []byte)
 	proposeC3 := make(chan []byte)
 	_, _, _ = proposeC1, proposeC2, proposeC3
-	commitC := raft_node.NewRaftNode(context.Background(), 1, peers,
+	commitC1 := raft_node.NewRaftNode(context.Background(), 1, peers,
 		proposeC1, nil)
-	_ = raft_node.NewRaftNode(context.Background(), 2, peers,
+	commitC2 := raft_node.NewRaftNode(context.Background(), 2, peers,
 		proposeC2, nil)
-	_ = raft_node.NewRaftNode(context.Background(), 3, peers,
+	commitC3 := raft_node.NewRaftNode(context.Background(), 3, peers,
 		proposeC3, nil)
+
+	//wait for replay
+	<-commitC1
+	<-commitC2
+	<-commitC3
+
+	//test
+	commitC := make(chan []byte)
+	var commitCs []<-chan []byte
+	commitCs = append(commitCs, commitC1)
+	commitCs = append(commitCs, commitC2)
+	commitCs = append(commitCs, commitC3)
+	for _, c := range commitCs {
+		go func(c <-chan []byte) {
+			for bs := range c {
+				commitC <- bs
+			}
+		}(c)
+	}
 	go func() {
 		for data := range commitC {
 			if len(data) != len("hello raft") {
-				panic("")
+				panic(string(data))
 			}
 		}
 	}()

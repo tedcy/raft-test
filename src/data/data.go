@@ -5,12 +5,12 @@ import (
 )
 
 type Data struct {
-	data		map[string]string
+	data map[string]string
 	sync.Mutex
 }
 
 func NewData() (*Data, error) {
-	var d Data	
+	var d Data
 	d.data = make(map[string]string)
 	return &d, nil
 }

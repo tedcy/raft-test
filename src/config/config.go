@@ -1,6 +1,6 @@
 package config
 
 type Config struct {
-	Addr		[]string
-	MyAddr		string
+	Addr   []string
+	MyAddr string
 }
